@@ -22,11 +22,9 @@ re-serving it as RTCM3 corrections.
   survey-in automatically and streams UBX **and** RTCM3 correction messages
   out its USB serial port -- no per-boot manual configuration needed.
 - `ntrip_caster.py` reads that serial port and re-serves it as an NTRIP
-  stream over TCP. This part is **not** automatic/persistent -- it's a plain
-  script, not a system service. It only runs while you start it, and does not
-  survive a reboot or logout on its own (or a new terminal session -- restart
-  with the command in "Usage" below). See "Making it survive reboot" below if
-  you want that.
+  stream over TCP. Run by hand it only lives as long as your terminal; install
+  the `herepro-ntrip` systemd user service (see "Running it as a service"
+  below) to have it start at boot and stay up.
 
 ## Hard-won gotchas (don't relearn these)
 
@@ -93,7 +91,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # headless mode instead (for systemd, logging, or a backgrounded/non-interactive
 # shell that has no real tty -- auto-detected and used automatically in that case,
-# or force it explicitly):
+# or force it explicitly). Settings also come from env vars (NTRIP_PORT,
+# NTRIP_MOUNT, HEREPRO_SERIAL, HEREPRO_BAUD, FIDUCIAL, STATUS_S):
 .venv/bin/python ntrip_caster.py --no-ui
 
 # in another terminal: one-shot status check without disturbing the caster
@@ -145,8 +144,16 @@ its Tailscale IP.
   handshake, works with Mission Planner, QGC, `str2str`, u-center, etc.), and
   shows live status via curses (or headless periodic log lines with
   `--no-ui` / when there's no real tty).
-- `ubx_parse.py` -- shared UBX NAV-PVT / NAV-SVIN decoding and RTCM3 frame
-  counting, used by both `ntrip_caster.py` and `check_status.py`.
+- `start_base.sh` -- one-command start: asks for a sampling time and
+  (optionally) a fiducial, starts the caster or reuses a running one (incl. the
+  service), averages the position, checks survey-in and that RTCM 1005 (base
+  position) is being sent, then prints the exact NTRIP settings for Mission
+  Planner / QGC / MAVProxy / str2str for each network interface. `-h` for flags.
+- `systemd/` -- `herepro-ntrip.service` user unit, `base.env.example`
+  settings, and deploy steps (`systemd/README.md`).
+- `ubx_parse.py` -- shared UBX NAV-PVT / NAV-SVIN decoding, RTCM3 frame
+  counting, and `split_frames()` (checksum-checked incremental stream parser
+  used by `ntrip_caster.py`), used by both `ntrip_caster.py` and `check_status.py`.
 - `geo.py` -- WGS84 ECEF/ENU math (lat/lon/height -> East/North/Up offset
   between two points), used for the fiducial correction display and
   occupation-sample spread calculation.
@@ -184,23 +191,10 @@ its Tailscale IP.
   reference / a future retry, not currently a working substitute for Mission
   Planner.
 
-## Making it survive reboot (optional, not done yet)
+## Running it as a service (survives reboot)
 
-If you want the caster to auto-start instead of being a manual foreground
-script, the straightforward option is a systemd user service:
-
-```ini
-# ~/.config/systemd/user/herepro-ntrip.service
-[Unit]
-Description=HerePro NTRIP caster
-
-[Service]
-ExecStart=/usr/bin/python3 %h/Projects/herepro-rtk-ntrip/ntrip_caster.py --serial /dev/serial/by-id/usb-CubePilot_HerePro_200025000E51333530383436-if01 --mount HEREPRO --port 2101
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-Then `systemctl --user enable --now herepro-ntrip.service`. Not set up by
-default since it wasn't asked for -- ask if you want this wired up.
+`systemd/` has a user unit (`herepro-ntrip.service`) plus a settings file
+(`base.env.example`) -- deploy steps in [`systemd/README.md`](systemd/README.md).
+Once installed it starts at boot (no login needed), waits for the HerePro,
+reconnects after replugs, and logs to `journalctl --user -u herepro-ntrip -f`.
+`start_base.sh` detects the running service and reuses it.

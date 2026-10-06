@@ -11,12 +11,17 @@ Usage:
   python3 ntrip_caster.py                          # auto-discover device, TUI on
   python3 ntrip_caster.py --serial /dev/ttyACM0     # pin a specific device
   python3 ntrip_caster.py --no-ui                   # headless (for systemd/logs)
+
+Settings can also come from the environment (see systemd/base.env.example):
+NTRIP_PORT, NTRIP_MOUNT, HEREPRO_SERIAL, HEREPRO_BAUD, FIDUCIAL, STATUS_S.
+Command-line flags override them.
 """
 
 import argparse
 import curses
 import glob
 import json
+import logging
 import os
 import socket
 import sys
@@ -25,11 +30,14 @@ import time
 
 import serial
 
-from ubx_parse import find_ubx_msgs, decode_nav_pvt, decode_nav_svin, count_rtcm3_frames, FIX_TYPE_NAMES
+from ubx_parse import split_frames, decode_nav_pvt, decode_nav_svin, FIX_TYPE_NAMES
 from geo import enu_offset
 
 BY_ID_GLOB = "/dev/serial/by-id/usb-CubePilot_HerePro_*-if01"
 FIDUCIAL_FILE = os.path.expanduser("~/.herepro_fiducial.json")
+CLIENT_SEND_TIMEOUT_S = 2  # a stalled NTRIP client is dropped instead of blocking the serial reader
+
+log = logging.getLogger("ntrip_caster")
 
 
 def discover_serial_device():
@@ -96,6 +104,7 @@ class SharedState:
         self.bytes_per_sec = 0
         self.rtcm_frames_this_second = 0
         self.rtcm_frames_per_sec = 0
+        self.rtcm_types = set()      # RTCM3 message types seen since the device (re)connected
         self.last_pvt = None
         self.last_pvt_age = None
         self.last_svin = None
@@ -122,6 +131,7 @@ class SharedState:
                 total_bytes=self.total_bytes,
                 bytes_per_sec=self.bytes_per_sec,
                 rtcm_frames_per_sec=self.rtcm_frames_per_sec,
+                rtcm_types=sorted(self.rtcm_types),
                 last_pvt=self.last_pvt,
                 last_pvt_age=(time.time() - self.last_pvt_age) if self.last_pvt_age else None,
                 last_svin=self.last_svin,
@@ -152,26 +162,77 @@ def rate_ticker(state, stop_event):
             state.rtcm_frames_this_second = 0
 
 
+def _sync_client_state(state, clients):
+    """Mirror the live client list into state; caller holds clients_lock."""
+    with state.lock:
+        state.client_count = len(clients)
+        state.client_addrs = [peer for _, peer in clients]
+
+
+def _record_pvt(state, payload):
+    """Decode a NAV-PVT, log fix changes, feed an active occupation sample. Caller holds state.lock."""
+    prev = state.last_pvt
+    p = decode_nav_pvt(payload)
+    state.last_pvt = p
+    state.last_pvt_age = time.time()
+    state.pvt_seq += 1
+    if prev is None or prev["fixType"] != p["fixType"]:
+        log.info("fix: %s -> %s (%d sats, hAcc %.2f m)",
+                 FIX_TYPE_NAMES.get(prev["fixType"], prev["fixType"]) if prev else "none",
+                 FIX_TYPE_NAMES.get(p["fixType"], p["fixType"]), p["numSV"], p["hAcc_m"])
+    if state.sampling:
+        state.sample_points.append((p["lat"], p["lon"], p["height_m"]))
+        done = False
+        if state.sample_mode == "count" and len(state.sample_points) >= state.sample_target:
+            done = True
+        elif state.sample_mode == "time" and (time.time() - state.sample_started_at) >= state.sample_target:
+            done = True
+        if done:
+            state.last_sample = finalize_sample(state.sample_points, state.sample_started_at)
+            state.sampling = False
+
+
+def _record_svin(state, payload):
+    """Decode a NAV-SVIN and log when survey-in becomes (or stops being) valid. Caller holds state.lock."""
+    prev = state.last_svin
+    s = decode_nav_svin(payload)
+    state.last_svin = s
+    if s["valid"] and not (prev and prev["valid"]):
+        log.info("survey-in VALID: acc %.3f m after %d s, %d observations", s["meanAcc_m"], s["duration_s"], s["observations"])
+    elif prev and prev["valid"] and not s["valid"]:
+        log.warning("survey-in no longer valid (receiver restarted it?)")
+
+
 def serial_reader(args, clients, clients_lock, stop_event, state):
     buf = bytearray()
+    last_problem = None  # log each distinct "can't read the device" reason once, not every second
+
+    def problem(msg, detail):
+        nonlocal last_problem
+        with state.lock:
+            state.connected = False
+            state.last_error = msg
+        if msg != last_problem:
+            log.warning("%s (%s) -- retrying every 1 s", msg, detail)
+            last_problem = msg
+
     while not stop_event.is_set():
         path = args.serial or discover_serial_device()
         if not path:
-            with state.lock:
-                state.connected = False
-                state.last_error = "no HerePro device found"
+            problem("no HerePro device found", args.serial or BY_ID_GLOB)
             time.sleep(1)
             continue
 
         try:
             ser = serial.Serial(path, baudrate=args.baud, timeout=1)
         except Exception as e:
-            with state.lock:
-                state.connected = False
-                state.last_error = f"open failed: {e}"
+            problem(f"open failed: {e}", path)
             time.sleep(1)
             continue
 
+        last_problem = None
+        buf.clear()
+        log.info("HerePro connected: %s (%s)", path, os.path.realpath(path))
         with state.lock:
             state.connected = True
             state.serial_path = path
@@ -181,9 +242,14 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
             try:
                 data = ser.read(2048)
             except Exception as e:
+                log.warning("HerePro lost: %s", path)
+                problem(f"read error: {e}", path)
                 with state.lock:
-                    state.connected = False
-                    state.last_error = f"read error: {e}"
+                    # nothing is being sent now, and a replug reboots the HerePro anyway:
+                    # survey-in and RTCM output start over
+                    state.rtcm_types = set()
+                    state.last_pvt = None
+                    state.last_svin = None
                 break
 
             if not data:
@@ -193,49 +259,42 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
                 dead = []
                 for c in clients:
                     try:
-                        c.sendall(data)
+                        c[0].sendall(data)
                     except Exception:
                         dead.append(c)
                 for d in dead:
                     clients.remove(d)
                     try:
-                        d.close()
+                        d[0].close()
                     except Exception:
                         pass
+                    log.info("NTRIP client disconnected: %s (%d connected)", d[1], len(clients))
+                if dead:
+                    _sync_client_state(state, clients)
 
             buf.extend(data)
-            rtcm_count = count_rtcm3_frames(bytes(buf))
-            pvts = find_ubx_msgs(bytes(buf), 0x01, 0x07)
-            svins = find_ubx_msgs(bytes(buf), 0x01, 0x3B)
+            frames, used = split_frames(buf)
+            del buf[:used]
+            if len(buf) > 8192:
+                del buf[:-1024]  # never happens with real frames; guards against a garbage stream
             with state.lock:
                 state.total_bytes += len(data)
                 state.bytes_this_second += len(data)
-                state.rtcm_frames_this_second += rtcm_count
-                if pvts:
+                for kind, key, payload in frames:
                     try:
-                        state.last_pvt = decode_nav_pvt(pvts[-1])
-                        state.last_pvt_age = time.time()
-                        state.pvt_seq += 1
-                        if state.sampling:
-                            p = state.last_pvt
-                            state.sample_points.append((p["lat"], p["lon"], p["height_m"]))
-                            done = False
-                            if state.sample_mode == "count" and len(state.sample_points) >= state.sample_target:
-                                done = True
-                            elif state.sample_mode == "time" and (time.time() - state.sample_started_at) >= state.sample_target:
-                                done = True
-                            if done:
-                                state.last_sample = finalize_sample(state.sample_points, state.sample_started_at)
-                                state.sampling = False
+                        if kind == "rtcm":
+                            state.rtcm_frames_this_second += 1
+                            if key not in state.rtcm_types:
+                                state.rtcm_types.add(key)
+                                note = " -- base position, rovers can now use the corrections" if key in (1005, 1006) else ""
+                                log.info("RTCM3 %d now being sent%s (types: %s)", key, note,
+                                         " ".join(map(str, sorted(state.rtcm_types))))
+                        elif key == (0x01, 0x07):
+                            _record_pvt(state, payload)
+                        elif key == (0x01, 0x3B):
+                            _record_svin(state, payload)
                     except Exception:
-                        pass
-                if svins:
-                    try:
-                        state.last_svin = decode_nav_svin(svins[-1])
-                    except Exception:
-                        pass
-            if len(buf) > 8192:
-                del buf[:-512]  # keep a small tail for message boundary continuity
+                        log.debug("could not decode %s %s", kind, key, exc_info=True)
 
         try:
             ser.close()
@@ -269,17 +328,19 @@ def handle_client(conn, addr, mount, clients, clients_lock, state):
             return
 
         if f"GET /{mount}" not in first_line:
+            log.warning("NTRIP client %s:%d asked for unknown mount: %s", addr[0], addr[1], first_line)
             conn.sendall(b"ICY 404 Not Found\r\n\r\n")
             conn.close()
             return
 
-        conn.settimeout(None)
+        conn.settimeout(CLIENT_SEND_TIMEOUT_S)
         conn.sendall(b"ICY 200 OK\r\n\r\n")
+        peer = f"{addr[0]}:{addr[1]}"
         with clients_lock:
-            clients.append(conn)
-        with state.lock:
-            state.client_count = len(clients)
-            state.client_addrs.append(f"{addr[0]}:{addr[1]}")
+            clients.append((conn, peer))
+            _sync_client_state(state, clients)
+            n = len(clients)
+        log.info("NTRIP client connected: %s (%d connected)", peer, n)
     except Exception:
         try:
             conn.close()
@@ -298,9 +359,6 @@ def accept_loop(srv, mount, clients, clients_lock, state, stop_event):
             break
         t = threading.Thread(target=handle_client, args=(conn, addr, mount, clients, clients_lock, state), daemon=True)
         t.start()
-        with clients_lock:
-            with state.lock:
-                state.client_count = len(clients)
 
 
 def fmt_age(seconds):
@@ -397,7 +455,7 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
 
         line(6, f" NTRIP mount   : /{s['mount']}  port {s['port']}   clients connected: {s['client_count']}")
         if s["client_addrs"]:
-            line(7, f" Recent clients: {', '.join(s['client_addrs'][-4:])}")
+            line(7, f" Clients       : {', '.join(s['client_addrs'][-4:])}")
 
         line(9, " --- GNSS fix (NAV-PVT) ---", curses.A_UNDERLINE)
         pvt = s["last_pvt"]
@@ -424,7 +482,9 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
 
         line(20, " --- Data flow ---", curses.A_UNDERLINE)
         line(21, f" Throughput    : {s['bytes_per_sec']} bytes/sec  ({s['bytes_per_sec']*8} bps)")
-        line(22, f" RTCM3 frames  : {s['rtcm_frames_per_sec']}/sec")
+        types_txt = " ".join(map(str, s["rtcm_types"])) or "none yet"
+        base_txt = "" if (1005 in s["rtcm_types"] or 1006 in s["rtcm_types"]) else "  (no 1005 base position yet)"
+        line(22, f" RTCM3 frames  : {s['rtcm_frames_per_sec']}/sec   types: {types_txt}{base_txt}")
         line(23, f" Total received: {s['total_bytes']:,} bytes   uptime {s['uptime']:.0f}s")
 
         line(25, " --- Occupation sample (averaged position) ---", curses.A_UNDERLINE)
@@ -476,7 +536,7 @@ def run_tui(state, stop_event, default_sample_count=50):
     curses.wrapper(_main)
 
 
-def run_headless(state, stop_event):
+def run_headless(state, stop_event, every=2.0):
     while not stop_event.is_set():
         s = state.snapshot()
         pvt = s["last_pvt"]
@@ -488,25 +548,30 @@ def run_headless(state, stop_event):
             off = enu_offset(s["fiducial"]["lat"], s["fiducial"]["lon"], s["fiducial"]["height_m"],
                               pvt["lat"], pvt["lon"], pvt["height_m"])
             fid_str = f" | err_vs_fiducial={off['dist_3d_m']*100:.1f}cm"
-        print(f"[{time.strftime('%H:%M:%S')}] {'UP' if s['connected'] else 'DOWN'} "
-              f"clients={s['client_count']} {s['bytes_per_sec']}B/s rtcm={s['rtcm_frames_per_sec']}/s | {pvt_str} | {svin_str}{fid_str}",
-              flush=True)
-        time.sleep(2)
+        base = "yes" if (1005 in s["rtcm_types"] or 1006 in s["rtcm_types"]) else "no"
+        log.info("%s clients=%d %dB/s rtcm=%d/s base_pos=%s | %s | %s%s",
+                 "UP" if s["connected"] else "DOWN", s["client_count"], s["bytes_per_sec"],
+                 s["rtcm_frames_per_sec"], base, pvt_str, svin_str, fid_str)
+        stop_event.wait(every)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=2101)
-    ap.add_argument("--mount", default="HEREPRO")
-    ap.add_argument("--serial", default=None, help="serial device path; default: auto-discover via /dev/serial/by-id")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--port", type=int, default=int(os.getenv("NTRIP_PORT", "2101")))
+    ap.add_argument("--mount", default=os.getenv("NTRIP_MOUNT", "HEREPRO"))
+    ap.add_argument("--serial", default=os.getenv("HEREPRO_SERIAL") or None,
+                     help="serial device path; default: auto-discover via /dev/serial/by-id")
+    ap.add_argument("--baud", type=int, default=int(os.getenv("HEREPRO_BAUD", "115200")))
     ap.add_argument("--no-ui", action="store_true", help="headless mode: periodic status lines instead of curses TUI")
-    ap.add_argument("--fiducial", default=None, metavar="LAT,LON,HEIGHT_M",
+    ap.add_argument("--status-every", type=float, default=float(os.getenv("STATUS_S", "2")),
+                     help="headless mode: seconds between status lines (default: 2)")
+    ap.add_argument("--fiducial", default=os.getenv("FIDUCIAL") or None, metavar="LAT,LON,HEIGHT_M",
                      help="set a known reference point at startup (e.g. --fiducial 28.748599,77.117063,201.5); "
                           "persists to ~/.herepro_fiducial.json. Omit to reuse a previously-saved fiducial, if any.")
     ap.add_argument("--sample-count", type=int, default=50,
                      help="default fix count for the 'r' (count-based) occupation sample in the TUI (default: 50)")
     args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
 
     fiducial = load_fiducial()
     if args.fiducial:
@@ -514,8 +579,8 @@ def main():
             lat, lon, height = (float(x) for x in args.fiducial.split(","))
             fiducial = save_fiducial(lat, lon, height)
         except ValueError:
-            print(f"--fiducial must be LAT,LON,HEIGHT_M (got: {args.fiducial!r})", file=sys.stderr)
-            sys.exit(1)
+            log.error("--fiducial / FIDUCIAL must be LAT,LON,HEIGHT_M (got: %r)", args.fiducial)
+            return 1
 
     state = SharedState(args.mount, args.port, fiducial=fiducial)
     clients = []
@@ -524,27 +589,40 @@ def main():
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", args.port))
+    try:
+        srv.bind(("0.0.0.0", args.port))
+    except OSError as e:
+        log.error("can't listen on port %d: %s -- is another caster already running? "
+                  "(check: systemctl --user status herepro-ntrip)", args.port, e)
+        return 1
     srv.listen(8)
+    log.info("NTRIP caster on 0.0.0.0:%d/%s, serial %s", args.port, args.mount, args.serial or f"auto ({BY_ID_GLOB})")
+    if fiducial:
+        log.info("fiducial: %.8f, %.8f, %.3f m", fiducial["lat"], fiducial["lon"], fiducial["height_m"])
+
+    use_tui = not args.no_ui and sys.stdout.isatty()
+    if use_tui:
+        logging.getLogger().handlers = [logging.NullHandler()]  # curses owns the screen
 
     threading.Thread(target=serial_reader, args=(args, clients, clients_lock, stop_event, state), daemon=True).start()
     threading.Thread(target=accept_loop, args=(srv, args.mount, clients, clients_lock, state, stop_event), daemon=True).start()
     threading.Thread(target=rate_ticker, args=(state, stop_event), daemon=True).start()
 
-    if not args.no_ui and sys.stdout.isatty():
+    if use_tui:
         try:
             run_tui(state, stop_event, args.sample_count)
         except KeyboardInterrupt:
             pass
     else:
         try:
-            run_headless(state, stop_event)
+            run_headless(state, stop_event, args.status_every)
         except KeyboardInterrupt:
             pass
 
     stop_event.set()
     srv.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -61,6 +61,82 @@ def count_rtcm3_frames(data):
     return count
 
 
+def _make_crc24q_table():
+    table = []
+    for i in range(256):
+        crc = i << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+        table.append(crc & 0xFFFFFF)
+    return table
+
+
+_CRC24Q = _make_crc24q_table()
+
+
+def crc24q(data):
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) & 0xFFFFFF) ^ _CRC24Q[(crc >> 16) ^ b]
+    return crc
+
+
+def split_frames(buf):
+    """Pull checksum-valid UBX and RTCM3 frames off the front of a stream buffer.
+
+    Returns (frames, consumed): frames are ("ubx", (cls, id), payload) or
+    ("rtcm", msg_type, frame_bytes); consumed is how many leading bytes of buf
+    are done with (frames + junk). An incomplete frame at the end is left
+    unconsumed for the next call, so each frame is reported exactly once.
+    """
+    frames = []
+    i, n = 0, len(buf)
+    while i < n:
+        b0 = buf[i]
+        if b0 == 0xB5:
+            if i + 6 > n:
+                break
+            if buf[i + 1] != 0x62:
+                i += 1
+                continue
+            length = buf[i + 4] | (buf[i + 5] << 8)
+            end = i + 8 + length
+            if end > n:
+                if length > 8192:  # implausible length: junk, not a frame
+                    i += 1
+                    continue
+                break
+            ck_a = ck_b = 0
+            for x in buf[i + 2:end - 2]:
+                ck_a = (ck_a + x) & 0xFF
+                ck_b = (ck_b + ck_a) & 0xFF
+            if (ck_a, ck_b) == (buf[end - 2], buf[end - 1]):
+                frames.append(("ubx", (buf[i + 2], buf[i + 3]), bytes(buf[i + 6:end - 2])))
+                i = end
+                continue
+            i += 1
+        elif b0 == 0xD3:
+            if i + 3 > n:
+                break
+            if buf[i + 1] & 0xFC:  # 6 reserved bits must be zero
+                i += 1
+                continue
+            length = ((buf[i + 1] & 0x03) << 8) | buf[i + 2]
+            end = i + 6 + length
+            if end > n:
+                break
+            if length >= 2 and crc24q(buf[i:end - 3]) == int.from_bytes(buf[end - 3:end], "big"):
+                frames.append(("rtcm", (buf[i + 3] << 4) | (buf[i + 4] >> 4), bytes(buf[i:end])))
+                i = end
+                continue
+            i += 1
+        else:
+            i += 1
+    return frames, i
+
+
 FIX_TYPE_NAMES = {
     0: "NO FIX",
     1: "DEAD RECKONING",
