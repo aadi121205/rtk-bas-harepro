@@ -1,0 +1,17 @@
+[Unit]
+Description=HerePro RTK base -> NTRIP caster (RTCM3 on :2101, waits for / reconnects to the HerePro on USB)
+After=network-online.target
+Wants=network-online.target
+# the code lives at ~/rtk-bas-harepro, see README.md
+ConditionPathExists=%h/rtk-bas-harepro/ntrip_caster.py
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rtk-bas-harepro
+EnvironmentFile=%h/.config/herepro/base.env
+ExecStart=%h/rtk-bas-harepro/.venv/bin/python -u ntrip_caster.py --no-ui
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
