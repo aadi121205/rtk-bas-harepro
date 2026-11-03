@@ -174,7 +174,7 @@ def data_logger(state, stop_event, log_dir):
     path = os.path.join(log_dir, f"herepro_{stamp}.csv")
     cols = ["utc", "connected", "fixType", "numSV", "hAcc_m", "vAcc_m", "lat", "lon", "height_m",
             "svin_active", "svin_valid", "svin_dur_s", "svin_meanAcc_m", "bytes_per_s", "rtcm_frames_per_s",
-            "clients", "rtcm_types"]
+            "clients", "trk_GPS", "trk_GAL", "trk_BDS", "trk_GLO", "trk_total", "rtcm_types"]
     state.log_path = path
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -185,6 +185,9 @@ def data_logger(state, stop_event, log_dir):
             with state.lock:
                 pvt, svin = state.last_pvt, state.last_svin
                 types = dict(state.rtcm_types_last)
+                fresh = state.tracked_at and time.time() - state.tracked_at < 5
+                trk = [sum(1 for (g, _) in state.tracked if g == gid) if fresh else "" for gid in (0, 2, 3, 6)]
+                trk_total = len(state.tracked) if fresh else ""
                 row = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), int(state.connected),
                        pvt["fixType"] if pvt else "", pvt["numSV"] if pvt else "",
                        f"{pvt['hAcc_m']:.3f}" if pvt else "", f"{pvt['vAcc_m']:.3f}" if pvt else "",
@@ -192,7 +195,7 @@ def data_logger(state, stop_event, log_dir):
                        f"{pvt['height_m']:.3f}" if pvt else "",
                        int(svin["active"]) if svin else "", int(svin["valid"]) if svin else "",
                        svin["duration_s"] if svin else "", f"{svin['meanAcc_m']:.4f}" if svin else "",
-                       state.bytes_per_sec, state.rtcm_frames_per_sec, state.client_count,
+                       state.bytes_per_sec, state.rtcm_frames_per_sec, state.client_count, *trk, trk_total,
                        " ".join(f"{k}:{v}" for k, v in sorted(types.items()))]
             w.writerow(row)
             f.flush()

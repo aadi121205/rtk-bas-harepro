@@ -207,12 +207,27 @@ position, and heading must come from the drone's compass or a dual-antenna
 setup. (I haven't verified whether your specific HerePro has a second
 antenna/receiver.)
 
+## HerePro parameters seen over MAVLink
+
+Reading the HerePro with MAVProxy's `paramedit` returned 9 parameters:
+`B_ENABLE=1`, `B_S_IN_EN=1` (survey-in on), `B_S_IN_ACC` (survey accuracy
+limit, was 2.0, now 1.0 -- units not shown, appears to be metres),
+`B_S_IN_TIME=20` (minimum survey time, appears to be seconds),
+`B_S_IN_LAT/LON/ALT` (fixed position, 0 = unset), `B_LOGGING`,
+`FORMAT_VERSION`. Changing a `B_S_IN_*` value restarts survey-in. There is no
+GNSS-mode (constellation) parameter in that list, so GLONASS may not be
+switchable that way. Stop the caster before connecting MAVProxy to the same
+port. The sky plot flags untracked satellites only above 10 deg elevation
+and warns when its tracked count differs from the receiver's own satellite
+count by more than 3 (the tracking messages, RXM-RAWX, come and go).
+
 ## Logging
 
 The caster writes `logs/herepro_<timestamp>.csv` once a second (disable with
 `--no-log`, move with `--log-dir`): fix type, satellites, hAcc/vAcc, position,
 survey-in state, bytes/s, RTCM frames/s, client count and which RTCM message
-numbers arrived that second (e.g. `1005:1 1077:1 1087:1`). Line this up with
+numbers arrived that second, and tracked-satellite counts per constellation
+(`trk_*`, blank when the receiver isn't sending RXM-RAWX) (e.g. `1005:1 1077:1 1087:1`). Line this up with
 your drone's dataflash log to see whether rover noise coincides with a base
 fix drop, a missing message type, or a client reconnect.
 

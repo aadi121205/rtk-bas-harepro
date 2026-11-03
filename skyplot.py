@@ -28,6 +28,7 @@ from geo import lla_to_ecef, ecef_delta_to_enu
 
 CACHE_DIR = os.path.expanduser("~/.cache/herepro")
 CACHE_MAX_AGE_S = 6 * 3600
+ELEV_MASK_DEG = 10   # below this, an untracked satellite is normal (weak/blocked), not flagged
 GROUPS = ("gps-ops", "glo-ops", "galileo", "beidou")
 
 # gnssId (UBX numbering) -> (letter, name)
@@ -172,7 +173,8 @@ def draw_skyplot(stdscr, sky, pvt, tracked):
     for gnss, prn, az, el in sats:
         letter = GNSS_INFO[gnss][0]
         cno = tracked.get((gnss, prn)) if prn is not None else None
-        stats[gnss][1] += 1
+        if el >= ELEV_MASK_DEG:
+            stats[gnss][1] += 1
         if prn is not None:
             if cno is not None:
                 stats[gnss][0] += 1
@@ -183,6 +185,8 @@ def draw_skyplot(stdscr, sky, pvt, tracked):
             put(y, x, letter.lower(), curses.A_DIM)
         elif not have_trk:
             rows.append((0, y, x, f"{letter}{prn:02d}", curses.A_BOLD))
+        elif cno is None and el < ELEV_MASK_DEG:
+            rows.append((0, y, x, f"{letter}{prn:02d}", curses.A_DIM))
         elif cno is None:
             rows.append((0, y, x, f"{letter}{prn:02d}", curses.color_pair(3)))
         else:
@@ -193,7 +197,7 @@ def draw_skyplot(stdscr, sky, pvt, tracked):
 
     # side panel
     px = cx + rx + 8
-    put(3, px, "Constellation   tracked / predicted above horizon", curses.A_BOLD)
+    put(3, px, f"Constellation   tracked / predicted above {ELEV_MASK_DEG} deg", curses.A_BOLD)
     row = 4
     for gnss, (letter, name) in GNSS_INFO.items():
         trk_all = sorted(s for (g, s) in tracked if g == gnss)
@@ -205,8 +209,15 @@ def draw_skyplot(stdscr, sky, pvt, tracked):
         else:
             txt = f"{len(trk_all):2d} / {vis:2d}"
         attr = curses.color_pair(3) | curses.A_BOLD if (have_trk and vis > 0 and not trk_all) else 0
-        note = "  <-- NOT TRACKED (enable in GPS_GNSS_MODE)" if attr else ""
+        note = "  <-- NOT TRACKED (constellation off on receiver?)" if attr else ""
         put(row, px, f"{letter} {name}        {txt}{note}", attr)
+        row += 1
+    if have_trk:
+        total = len(tracked)
+        mism = abs(total - pvt["numSV"]) > 3
+        put(row, px, f"Tracked total: {total}   receiver says it uses: {pvt['numSV']}"
+            + ("   <-- MISMATCH, plot may be incomplete" if mism else ""),
+            (curses.color_pair(2) | curses.A_BOLD) if mism else 0)
         row += 1
     row += 1
     if not have_trk:
@@ -215,7 +226,7 @@ def draw_skyplot(stdscr, sky, pvt, tracked):
     put(row, px, "Legend:", curses.A_BOLD); row += 1
     put(row, px, "G05 green  tracked, C/N0 >= 35 dB-Hz", curses.color_pair(1)); row += 1
     put(row, px, "G05 yellow tracked, C/N0 < 35 dB-Hz", curses.color_pair(2)); row += 1
-    put(row, px, "G05 red    above horizon, NOT tracked", curses.color_pair(3)); row += 1
+    put(row, px, f"G05 red    above {ELEV_MASK_DEG} deg, NOT tracked (dim = below)", curses.color_pair(3)); row += 1
     put(row, px, "e r  dim   Galileo/GLONASS prediction (no id match)", curses.A_DIM); row += 2
     put(row, px, "Rings: horizon / 30 / 60 deg, centre = zenith", curses.A_DIM); row += 1
     put(row, px, sky.status, curses.A_DIM)
