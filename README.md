@@ -111,8 +111,13 @@ periodic log lines instead, for non-interactive use.
 
 **Occupation sampling and fiducial correction** (for checking real
 ground-truth error, e.g. against a known survey point or another receiver):
-- `1`-`5` in the TUI: start a timed average (10/30/60/120/300s) of incoming
-  fixes.
+- `1`-`8` in the TUI: start a timed average of incoming fixes: 10s, 30s, 1,
+  2, 5, 10, 20 or 30 minutes.
+- `a`: average until the RMS spread drops below 0.5 m (needs at least 30
+  fixes, gives up and finalizes after 30 minutes). Spread is the RMS 3D
+  distance of fixes from their mean, so a noisy base may never reach 0.5 m;
+  the 30 min cap then ends it with whatever was collected. Tune
+  `SPREAD_TARGET_M` / `SPREAD_MAX_S` in `ntrip_caster.py`.
 - `r`: start a fixed-count average (default 50 fixes; change with
   `--sample-count N`).
 - `x`: stop/finalize the current sample early (uses whatever was collected).
@@ -132,9 +137,111 @@ ground-truth error, e.g. against a known survey point or another receiver):
   back to see how repeatably the base+rover solution returns to that exact
   spot, or compare against a surveyed truth coordinate directly.
 
+**Sky plot (`s` in the TUI):** horizon projection (N up, centre = zenith,
+rings at 0/30/60 deg elevation) of every GPS/Galileo/BeiDou/GLONASS satellite
+above your horizon, with a per-constellation "tracked / predicted" table. The
+receiver's USB stream has no azimuth/elevation (no NAV-SAT), so positions are
+predicted with SGP4 from CelesTrak orbital elements (cached in
+`~/.cache/herepro/`, refreshed every 6h; needs `sgp4`, see `skyplot.py`).
+If the stream carries UBX-RXM-RAWX, GPS/BeiDou satellites are coloured by
+C/N0 (green >= 35 dB-Hz, yellow weaker) or red if above the horizon but not
+tracked, and a constellation with satellites overhead but zero tracked is
+flagged. Galileo/GLONASS can't be matched to a receiver svId from the element
+sets, so they are drawn as dim lowercase letters and only counted. Without
+RAWX it shows prediction only. Accuracy is about a degree.
+
 Connect a rover/NTRIP client to `ntrip://<this-host-ip>:2101/HEREPRO`, no
 credentials needed. On the LAN use the machine's local IP; over Tailscale use
 its Tailscale IP.
+
+## What the HerePro decides vs. what this code decides
+
+- **The HerePro decides** (firmware + its own params, set via Mission
+  Planner's UAVCAN page, never from here): survey-in vs. fixed position, the
+  survey-in minimum duration and accuracy limit, which constellations it
+  tracks (`GPS_GNSS_MODE`), and which UBX/RTCM messages it streams. With
+  `B_ENABLE=1` it starts survey-in itself at every boot. This code only
+  *reads* that stream -- it never writes to the port (gotcha #2).
+- **This code decides**: the NTRIP serving, the TUI/sky plot, the CSV log,
+  and the averaging sessions (`1`-`8`, `a`, `r`). Those average the fixes the
+  receiver reports; they do not change what the receiver does or what your
+  rover receives. A better averaged position helps you set a fiducial or
+  enter a fixed base position, it does not tighten the receiver's own
+  survey-in.
+
+## Fix type "TIME ONLY" is normal on a finished base
+
+Once survey-in completes (`NAV-SVIN valid=1 active=0`) the base is in fixed
+mode and NAV-PVT reports fix type 5 (TIME ONLY): it is no longer solving for
+position, it is *using* the stored base position. This is expected, not a
+fault. Satellite count and hAcc keep updating but hAcc then reflects the
+frozen base position, not live positioning. (Check: fix type 5 together with
+`valid=1 active=0`. Fix type 5 while survey-in is still active, or never
+reaching `valid=1`, means something is wrong.)
+
+## If the base position degrades or looks wrong
+
+The rover is only as good as the base position it is told. Symptoms: rover
+offset of metres from truth, or `valid=0` / large `meanAcc` in NAV-SVIN.
+1. Don't fly on it. Check `svin_valid` and `svin_meanAcc_m` in the log.
+2. Check the sky plot (`s`): few tracked satellites or a missing constellation
+   usually means a bad antenna view (multipath, obstruction).
+3. Fix the antenna (sky view, ground plane, away from reflectors), then
+   **power-cycle the HerePro** -- that restarts survey-in. Wait for
+   `valid=1`.
+4. For repeat sites, average a long sample (`7`/`8`/`a`), set it as the
+   fiducial (`f`), and compare each day's result against it. A base position
+   that moves between days by more than the survey accuracy points to the
+   antenna or site, not the code.
+5. Tighter survey-in limits (minimum duration / accuracy) are set on the
+   HerePro, not here.
+
+## Heading
+
+Corrections (RTCM3) carry no heading, and a single base or single receiver
+does not give a heading from RTK. NAV-PVT has a heading-of-motion field, but
+it is only meaningful while moving. True heading from GNSS needs two
+receivers/antennas (moving baseline) or a compass/IMU on the drone. If you
+see no heading from the rover in RTK mode, that is why: RTK improves
+position, and heading must come from the drone's compass or a dual-antenna
+setup. (I haven't verified whether your specific HerePro has a second
+antenna/receiver.)
+
+## Logging
+
+The caster writes `logs/herepro_<timestamp>.csv` once a second (disable with
+`--no-log`, move with `--log-dir`): fix type, satellites, hAcc/vAcc, position,
+survey-in state, bytes/s, RTCM frames/s, client count and which RTCM message
+numbers arrived that second (e.g. `1005:1 1077:1 1087:1`). Line this up with
+your drone's dataflash log to see whether rover noise coincides with a base
+fix drop, a missing message type, or a client reconnect.
+
+## Getting less noise on the rover
+
+1. **Base antenna is the big one.** Clear sky, on a metal ground plane, well
+   away from walls/roofs/vehicles (multipath), rigidly fixed, USB cable
+   routed away from the antenna. Multipath shows up as low C/N0 and a
+   wandering base position.
+2. **Let survey-in finish properly / fix the base position.** The base's
+   absolute error shifts the rover by the same amount, so a base position
+   that is a few metres off is fine for relative flying but a *moving*
+   (still-surveying) one isn't. Only start flying once NAV-SVIN `valid=1`,
+   and prefer a long survey-in (accuracy limit under 1 m). Better: average,
+   then enter a fixed known position (`TMODE` fixed) so it never wanders.
+3. **Check what the base sends** (see `rtcm_types` in the log): you want 1005
+   (or 1006) plus MSM4/MSM7 for every constellation the rover tracks
+   (1074/1077 GPS, 1094/1097 Galileo, 1124/1127 BeiDou, 1084/1087 GLONASS).
+   A constellation the rover uses but the base does not send is wasted.
+4. **Enable all constellations on both ends** (`GPS_GNSS_MODE`); use the sky
+   plot (`s`) to check that the base is actually tracking what is overhead.
+5. **Link:** keep corrections flowing at 1 Hz with low latency; a rover that
+   only gets RTCM every few seconds drops from RTK Fixed to Float and gets
+   noisy. Watch `rtcm_frames_per_s` and `clients` in the log for gaps.
+6. **Rover side (ArduPilot):** `GPS_RTK_MASK`/`GPS_TYPE` for a moving-base-less
+   F9P, `GPS_AUTO_CONFIG=1`, the rover antenna away from FPV/telemetry
+   transmitters and carbon fibre, and a ground-station RTCM injection rate that
+   isn't throttled. Compare "RTK Fixed" vs "RTK Float" time -- float is where
+   the noise lives.
 
 ## Files
 
@@ -147,6 +254,7 @@ its Tailscale IP.
   `--no-ui` / when there's no real tty).
 - `ubx_parse.py` -- shared UBX NAV-PVT / NAV-SVIN decoding and RTCM3 frame
   counting, used by both `ntrip_caster.py` and `check_status.py`.
+- `skyplot.py` -- SGP4-based satellite az/el prediction and the curses sky plot.
 - `geo.py` -- WGS84 ECEF/ENU math (lat/lon/height -> East/North/Up offset
   between two points), used for the fiducial correction display and
   occupation-sample spread calculation.

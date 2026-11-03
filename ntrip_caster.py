@@ -22,10 +22,13 @@ import socket
 import sys
 import threading
 import time
+import collections
+import csv
 
 import serial
 
-from ubx_parse import find_ubx_msgs, decode_nav_pvt, decode_nav_svin, count_rtcm3_frames, FIX_TYPE_NAMES
+from ubx_parse import extract_frames, decode_nav_pvt, decode_nav_svin, decode_rxm_rawx, FIX_TYPE_NAMES
+from skyplot import SkyModel, draw_skyplot
 from geo import enu_offset
 
 BY_ID_GLOB = "/dev/serial/by-id/usb-CubePilot_HerePro_*-if01"
@@ -99,6 +102,11 @@ class SharedState:
         self.last_pvt = None
         self.last_pvt_age = None
         self.last_svin = None
+        self.log_path = None
+        self.rtcm_types_last = {}
+        self.rtcm_types = collections.Counter()   # RTCM msg number -> frames this second
+        self.tracked = {}          # (gnssId, svId) -> max C/N0 from latest RXM-RAWX
+        self.tracked_at = None
         self.client_count = 0
         self.client_addrs = []
         self.started_at = time.time()
@@ -107,7 +115,9 @@ class SharedState:
 
         # occupation sampling (time- or count-based averaging session)
         self.sampling = False
-        self.sample_mode = None      # "time" or "count"
+        self.sample_live_spread = None  # running RMS spread (m) for "spread" mode
+        self._spread_checked_at = 0
+        self.sample_mode = None      # "time", "count" or "spread"
         self.sample_target = None    # seconds (time) or sample count (count)
         self.sample_started_at = None
         self.sample_points = []      # list of (lat, lon, height_m)
@@ -125,6 +135,7 @@ class SharedState:
                 last_pvt=self.last_pvt,
                 last_pvt_age=(time.time() - self.last_pvt_age) if self.last_pvt_age else None,
                 last_svin=self.last_svin,
+                tracked=dict(self.tracked) if self.tracked_at and time.time() - self.tracked_at < 5 else {},
                 client_count=self.client_count,
                 client_addrs=list(self.client_addrs),
                 uptime=time.time() - self.started_at,
@@ -135,6 +146,7 @@ class SharedState:
                 sampling=self.sampling,
                 sample_mode=self.sample_mode,
                 sample_target=self.sample_target,
+                sample_live_spread=self.sample_live_spread,
                 sample_elapsed=(time.time() - self.sample_started_at) if self.sample_started_at else None,
                 sample_count=len(self.sample_points),
                 last_sample=dict(self.last_sample) if self.last_sample else None,
@@ -150,6 +162,40 @@ def rate_ticker(state, stop_event):
             state.bytes_this_second = 0
             state.rtcm_frames_per_sec = state.rtcm_frames_this_second
             state.rtcm_frames_this_second = 0
+            state.rtcm_types_last = dict(state.rtcm_types)
+            state.rtcm_types.clear()
+
+
+def data_logger(state, stop_event, log_dir):
+    """1 Hz CSV of fix quality, link health and RTCM message mix, plus an event
+    log, so noise on the rover can be correlated with what the base was doing."""
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(log_dir, f"herepro_{stamp}.csv")
+    cols = ["utc", "connected", "fixType", "numSV", "hAcc_m", "vAcc_m", "lat", "lon", "height_m",
+            "svin_active", "svin_valid", "svin_dur_s", "svin_meanAcc_m", "bytes_per_s", "rtcm_frames_per_s",
+            "clients", "rtcm_types"]
+    state.log_path = path
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        last_clients = None
+        while not stop_event.is_set():
+            time.sleep(1)
+            with state.lock:
+                pvt, svin = state.last_pvt, state.last_svin
+                types = dict(state.rtcm_types_last)
+                row = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), int(state.connected),
+                       pvt["fixType"] if pvt else "", pvt["numSV"] if pvt else "",
+                       f"{pvt['hAcc_m']:.3f}" if pvt else "", f"{pvt['vAcc_m']:.3f}" if pvt else "",
+                       f"{pvt['lat']:.9f}" if pvt else "", f"{pvt['lon']:.9f}" if pvt else "",
+                       f"{pvt['height_m']:.3f}" if pvt else "",
+                       int(svin["active"]) if svin else "", int(svin["valid"]) if svin else "",
+                       svin["duration_s"] if svin else "", f"{svin['meanAcc_m']:.4f}" if svin else "",
+                       state.bytes_per_sec, state.rtcm_frames_per_sec, state.client_count,
+                       " ".join(f"{k}:{v}" for k, v in sorted(types.items()))]
+            w.writerow(row)
+            f.flush()
 
 
 def serial_reader(args, clients, clients_lock, stop_event, state):
@@ -202,31 +248,59 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
                         d.close()
                     except Exception:
                         pass
+                if dead:
+                    with state.lock:
+                        state.client_count = len(clients)
 
             buf.extend(data)
-            rtcm_count = count_rtcm3_frames(bytes(buf))
-            pvts = find_ubx_msgs(bytes(buf), 0x01, 0x07)
-            svins = find_ubx_msgs(bytes(buf), 0x01, 0x3B)
+            msgs, rtcm_count, consumed = extract_frames(buf, state.rtcm_types)
+            del buf[:consumed]  # each frame is processed exactly once
+            if len(buf) > 8192:
+                buf.clear()
+            pvts = [p for c, m, p in msgs if c == 0x01 and m == 0x07]
+            svins = [p for c, m, p in msgs if c == 0x01 and m == 0x3B]
+            rawxs = [p for c, m, p in msgs if c == 0x02 and m == 0x15]
             with state.lock:
                 state.total_bytes += len(data)
                 state.bytes_this_second += len(data)
                 state.rtcm_frames_this_second += rtcm_count
                 if pvts:
                     try:
-                        state.last_pvt = decode_nav_pvt(pvts[-1])
-                        state.last_pvt_age = time.time()
-                        state.pvt_seq += 1
-                        if state.sampling:
-                            p = state.last_pvt
-                            state.sample_points.append((p["lat"], p["lon"], p["height_m"]))
-                            done = False
-                            if state.sample_mode == "count" and len(state.sample_points) >= state.sample_target:
-                                done = True
-                            elif state.sample_mode == "time" and (time.time() - state.sample_started_at) >= state.sample_target:
-                                done = True
-                            if done:
-                                state.last_sample = finalize_sample(state.sample_points, state.sample_started_at)
-                                state.sampling = False
+                        for pl in pvts:
+                            state.last_pvt = decode_nav_pvt(pl)
+                            state.last_pvt_age = time.time()
+                            state.pvt_seq += 1
+                            if state.sampling:
+                                p = state.last_pvt
+                                state.sample_points.append((p["lat"], p["lon"], p["height_m"]))
+                                done = False
+                                if state.sample_mode == "count" and len(state.sample_points) >= state.sample_target:
+                                    done = True
+                                elif state.sample_mode == "time" and (time.time() - state.sample_started_at) >= state.sample_target:
+                                    done = True
+                                elif state.sample_mode == "spread":
+                                    now = time.time()
+                                    if now - state._spread_checked_at >= 1 and len(state.sample_points) >= SPREAD_MIN_FIXES:
+                                        state._spread_checked_at = now
+                                        cur = finalize_sample(state.sample_points, state.sample_started_at)
+                                        state.sample_live_spread = cur["spread_m"]
+                                        if cur["spread_m"] is not None and cur["spread_m"] < state.sample_target:
+                                            done = True
+                                    if now - state.sample_started_at >= SPREAD_MAX_S:
+                                        done = True
+                                if done:
+                                    state.last_sample = finalize_sample(state.sample_points, state.sample_started_at)
+                                    state.sampling = False
+                    except Exception:
+                        pass
+                if rawxs:
+                    try:
+                        trk = {}
+                        for meas in decode_rxm_rawx(rawxs[-1]):
+                            k = (meas["gnssId"], meas["svId"])
+                            trk[k] = max(trk.get(k, 0), meas["cno"])
+                        state.tracked = trk
+                        state.tracked_at = time.time()
                     except Exception:
                         pass
                 if svins:
@@ -234,8 +308,6 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
                         state.last_svin = decode_nav_svin(svins[-1])
                     except Exception:
                         pass
-            if len(buf) > 8192:
-                del buf[:-512]  # keep a small tail for message boundary continuity
 
         try:
             ser.close()
@@ -273,7 +345,7 @@ def handle_client(conn, addr, mount, clients, clients_lock, state):
             conn.close()
             return
 
-        conn.settimeout(None)
+        conn.settimeout(0.5)  # bounded sends: a stalled client is dropped, never blocks the serial reader
         conn.sendall(b"ICY 200 OK\r\n\r\n")
         with clients_lock:
             clients.append(conn)
@@ -311,7 +383,11 @@ def fmt_age(seconds):
     return f"{seconds:.0f}s ago"
 
 
-TIME_PRESETS = {ord('1'): 10, ord('2'): 30, ord('3'): 60, ord('4'): 120, ord('5'): 300}
+TIME_PRESETS = {ord('1'): 10, ord('2'): 30, ord('3'): 60, ord('4'): 120, ord('5'): 300,
+                ord('6'): 600, ord('7'): 1200, ord('8'): 1800}
+SPREAD_TARGET_M = 0.5      # 'a': keep averaging until the RMS spread is below this...
+SPREAD_MIN_FIXES = 30      # ...but not before this many fixes (spread of a few points means nothing)
+SPREAD_MAX_S = 1800        # ...and give up (finalize what we have) after 30 min
 
 
 def draw_tui(stdscr, state, stop_event, default_sample_count=50):
@@ -319,12 +395,17 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
     stdscr.nodelay(True)
     stdscr.timeout(500)
     flash_msg = [None, 0]  # [text, expiry_time]
+    sky = SkyModel()
+    sky.start()
+    show_sky = False
 
     while not stop_event.is_set():
         c = stdscr.getch()
         if c in (ord('q'), ord('Q')):
             stop_event.set()
             break
+        elif c in (ord('s'), ord('S')):
+            show_sky = not show_sky
         elif c in (ord('f'), ord('F')):
             with state.lock:
                 pvt = state.last_pvt
@@ -370,6 +451,18 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
                     state.sample_points = []
             flash_msg[0] = f"Started {default_sample_count}-fix sample."
             flash_msg[1] = time.time() + 3
+        elif c in (ord('a'), ord('A')):
+            with state.lock:
+                if not state.sampling:
+                    state.sampling = True
+                    state.sample_mode = "spread"
+                    state.sample_target = SPREAD_TARGET_M
+                    state.sample_started_at = time.time()
+                    state.sample_points = []
+                    state.sample_live_spread = None
+                    state._spread_checked_at = 0
+            flash_msg[0] = f"Averaging until spread < {SPREAD_TARGET_M} m (max {SPREAD_MAX_S // 60} min)."
+            flash_msg[1] = time.time() + 3
         elif c in (ord('x'), ord('X')):
             with state.lock:
                 if state.sampling and state.sample_points:
@@ -387,6 +480,14 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
                 stdscr.addnstr(y, 0, text, max(w - 1, 0), attr)
 
         line(0, " HerePro RTK Base -> NTRIP  ".center(w - 1, "="), curses.A_BOLD)
+
+        if show_sky:
+            draw_skyplot(stdscr, sky, s["last_pvt"], s["tracked"])
+            if flash_msg[0] and time.time() < flash_msg[1]:
+                line(h - 2, f" >> {flash_msg[0]}", curses.A_BOLD)
+            line(h - 1, " q=quit  s=back to status ".center(w - 1, "-"))
+            stdscr.refresh()
+            continue
 
         conn_str = "CONNECTED" if s["connected"] else "DISCONNECTED / RECONNECTING"
         conn_attr = curses.A_BOLD | (curses.color_pair(1) if s["connected"] else curses.color_pair(2))
@@ -429,7 +530,11 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
 
         line(25, " --- Occupation sample (averaged position) ---", curses.A_UNDERLINE)
         if s["sampling"]:
-            if s["sample_mode"] == "time":
+            if s["sample_mode"] == "spread":
+                live = s["sample_live_spread"]
+                live_txt = f"{live:.2f}m" if live is not None else f"(need {SPREAD_MIN_FIXES} fixes)"
+                progress = f"spread {live_txt} -> target < {s['sample_target']}m, {s['sample_elapsed']:.0f}s / {SPREAD_MAX_S}s max, {s['sample_count']} fixes"
+            elif s["sample_mode"] == "time":
                 progress = f"{s['sample_elapsed']:.0f}s / {s['sample_target']}s"
             else:
                 progress = f"{s['sample_count']} / {s['sample_target']} fixes"
@@ -461,7 +566,7 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
         if flash_msg[0] and time.time() < flash_msg[1]:
             line(h - 2, f" >> {flash_msg[0]}", curses.A_BOLD)
 
-        line(h - 1, " q=quit  1-5/r=sample(time/count)  x=stop  f=set fiducial  c=clear fiducial ".center(w - 1, "-"))
+        line(h - 1, " q=quit  s=sky plot  1-8=timed(10s..30m)  a=until<0.5m  r=count  x=stop  f=set fiducial  c=clear fiducial ".center(w - 1, "-"))
         stdscr.refresh()
 
 
@@ -504,6 +609,8 @@ def main():
     ap.add_argument("--fiducial", default=None, metavar="LAT,LON,HEIGHT_M",
                      help="set a known reference point at startup (e.g. --fiducial 28.748599,77.117063,201.5); "
                           "persists to ~/.herepro_fiducial.json. Omit to reuse a previously-saved fiducial, if any.")
+    ap.add_argument("--log-dir", default="logs", help="directory for the 1 Hz CSV log (default: ./logs); use --no-log to disable")
+    ap.add_argument("--no-log", action="store_true", help="disable CSV logging")
     ap.add_argument("--sample-count", type=int, default=50,
                      help="default fix count for the 'r' (count-based) occupation sample in the TUI (default: 50)")
     args = ap.parse_args()
@@ -529,6 +636,8 @@ def main():
 
     threading.Thread(target=serial_reader, args=(args, clients, clients_lock, stop_event, state), daemon=True).start()
     threading.Thread(target=accept_loop, args=(srv, args.mount, clients, clients_lock, state, stop_event), daemon=True).start()
+    if not args.no_log:
+        threading.Thread(target=data_logger, args=(state, stop_event, args.log_dir), daemon=True).start()
     threading.Thread(target=rate_ticker, args=(state, stop_event), daemon=True).start()
 
     if not args.no_ui and sys.stdout.isatty():
