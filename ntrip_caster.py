@@ -393,6 +393,32 @@ SPREAD_MIN_FIXES = 30      # ...but not before this many fixes (spread of a few 
 SPREAD_MAX_S = 1800        # ...and give up (finalize what we have) after 30 min
 
 
+def prompt_line(stdscr, prompt):
+    """Blocking single-line text prompt on the bottom row. Returns text, or None on Esc."""
+    h, w = stdscr.getmaxyx()
+    buf = ""
+    curses.curs_set(1)
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.move(h - 2, 0)
+            stdscr.clrtoeol()
+            stdscr.addnstr(h - 2, 0, (prompt + buf)[-(w - 1):], w - 1, curses.A_BOLD)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (10, 13, curses.KEY_ENTER):
+                return buf
+            if ch == 27:
+                return None
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                buf = buf[:-1]
+            elif 32 <= ch < 127:
+                buf += chr(ch)
+    finally:
+        curses.curs_set(0)
+        stdscr.timeout(500)
+
+
 def draw_tui(stdscr, state, stop_event, default_sample_count=50):
     curses.curs_set(0)
     stdscr.nodelay(True)
@@ -426,6 +452,22 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
                 flash_msg[0] = "Fiducial set from current (single) position -- consider an averaged sample ('1'-'5' or 'r') for less noise."
             else:
                 flash_msg[0] = "Can't set fiducial: no fix yet."
+            flash_msg[1] = time.time() + 4
+        elif c in (ord('t'), ord('T')):
+            text = prompt_line(stdscr, "Fiducial LAT,LON,HEIGHT_M (Enter=ok, Esc=cancel): ")
+            if text is None:
+                flash_msg[0] = "Fiducial entry cancelled."
+            else:
+                try:
+                    lat, lon, height = (float(x) for x in text.replace(" ", "").split(","))
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        raise ValueError
+                    fid = save_fiducial(lat, lon, height)
+                    with state.lock:
+                        state.fiducial = fid
+                    flash_msg[0] = f"Fiducial set (typed): {lat:.7f}, {lon:.7f}, {height:.2f}m"
+                except ValueError:
+                    flash_msg[0] = "Invalid fiducial; expected LAT,LON,HEIGHT_M e.g. 28.748599,77.117063,201.5"
             flash_msg[1] = time.time() + 4
         elif c in (ord('c'), ord('C')):
             clear_fiducial()
@@ -569,7 +611,7 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
         if flash_msg[0] and time.time() < flash_msg[1]:
             line(h - 2, f" >> {flash_msg[0]}", curses.A_BOLD)
 
-        line(h - 1, " q=quit  s=sky plot  1-8=timed(10s..30m)  a=until<0.5m  r=count  x=stop  f=set fiducial  c=clear fiducial ".center(w - 1, "-"))
+        line(h - 1, " q=quit  s=sky plot  1-8=timed(10s..30m)  a=until<0.5m  r=count  x=stop  f=set fiducial  t=type fiducial  c=clear fiducial ".center(w - 1, "-"))
         stdscr.refresh()
 
 
