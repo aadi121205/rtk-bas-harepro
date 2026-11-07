@@ -31,6 +31,7 @@ from ubx_parse import extract_frames, decode_nav_pvt, decode_nav_svin, decode_rx
 from skyplot import SkyModel, draw_skyplot
 from geo import enu_offset
 
+STALL_S = 5  # no bytes for this long on an open port => treat the link as dead and reopen
 BY_ID_GLOB = "/dev/serial/by-id/usb-CubePilot_HerePro_*-if01"
 FIDUCIAL_FILE = os.path.expanduser("~/.herepro_fiducial.json")
 
@@ -92,6 +93,7 @@ class SharedState:
         self.mount = mount
         self.port = port
         self.connected = False
+        self.stalled = False   # port open but no bytes for STALL_S (board hung / rebooting)
         self.serial_path = None
         self.last_error = None
         self.total_bytes = 0
@@ -127,6 +129,7 @@ class SharedState:
         with self.lock:
             return dict(
                 connected=self.connected,
+                stalled=self.stalled,
                 serial_path=self.serial_path,
                 last_error=self.last_error,
                 total_bytes=self.total_bytes,
@@ -188,7 +191,7 @@ def data_logger(state, stop_event, log_dir):
                 fresh = state.tracked_at and time.time() - state.tracked_at < 5
                 trk = [sum(1 for (g, _) in state.tracked if g == gid) if fresh else "" for gid in (0, 2, 3, 6)]
                 trk_total = len(state.tracked) if fresh else ""
-                row = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), int(state.connected),
+                row = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), int(state.connected and not state.stalled),
                        pvt["fixType"] if pvt else "", pvt["numSV"] if pvt else "",
                        f"{pvt['hAcc_m']:.3f}" if pvt else "", f"{pvt['vAcc_m']:.3f}" if pvt else "",
                        f"{pvt['lat']:.9f}" if pvt else "", f"{pvt['lon']:.9f}" if pvt else "",
@@ -226,6 +229,7 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
             state.serial_path = path
             state.last_error = None
 
+        last_rx = time.time()
         while not stop_event.is_set():
             try:
                 data = ser.read(2048)
@@ -236,7 +240,18 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
                 break
 
             if not data:
+                if time.time() - last_rx > STALL_S:
+                    with state.lock:
+                        state.connected = False
+                        state.stalled = True
+                        state.last_error = f"no data for {STALL_S}s (board hung or rebooting?) - reopening port"
+                    break
                 continue
+
+            last_rx = time.time()
+            if state.stalled:
+                with state.lock:
+                    state.stalled = False
 
             with clients_lock:
                 dead = []
@@ -316,6 +331,8 @@ def serial_reader(args, clients, clients_lock, stop_event, state):
             ser.close()
         except Exception:
             pass
+        buf.clear()
+        time.sleep(1)  # don't hammer a port that just failed
 
 
 def handle_client(conn, addr, mount, clients, clients_lock, state):
@@ -534,8 +551,13 @@ def draw_tui(stdscr, state, stop_event, default_sample_count=50):
             stdscr.refresh()
             continue
 
-        conn_str = "CONNECTED" if s["connected"] else "DISCONNECTED / RECONNECTING"
-        conn_attr = curses.A_BOLD | (curses.color_pair(1) if s["connected"] else curses.color_pair(2))
+        if s["stalled"]:
+            conn_str, ok = f"NO DATA for >{STALL_S}s -- port open but silent, retrying", False
+        elif s["connected"]:
+            conn_str, ok = "CONNECTED", True
+        else:
+            conn_str, ok = "DISCONNECTED / RECONNECTING", False
+        conn_attr = curses.A_BOLD | (curses.color_pair(1) if ok else curses.color_pair(3))
         line(2, f" Serial device : {s['serial_path'] or '(searching...)'}")
         line(3, f" Link status   : {conn_str}", conn_attr)
         if s["last_error"]:
@@ -638,7 +660,7 @@ def run_headless(state, stop_event):
             off = enu_offset(s["fiducial"]["lat"], s["fiducial"]["lon"], s["fiducial"]["height_m"],
                               pvt["lat"], pvt["lon"], pvt["height_m"])
             fid_str = f" | err_vs_fiducial={off['dist_3d_m']*100:.1f}cm"
-        print(f"[{time.strftime('%H:%M:%S')}] {'UP' if s['connected'] else 'DOWN'} "
+        print(f"[{time.strftime('%H:%M:%S')}] {'STALL' if s['stalled'] else ('UP' if s['connected'] else 'DOWN')} "
               f"clients={s['client_count']} {s['bytes_per_sec']}B/s rtcm={s['rtcm_frames_per_sec']}/s | {pvt_str} | {svin_str}{fid_str}",
               flush=True)
         time.sleep(2)
